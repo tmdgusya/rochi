@@ -3,6 +3,7 @@ package http
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 )
 
@@ -38,4 +39,25 @@ func NewResponse(status int, body string) (*Response, error) {
 func (res *Response) WithHeader(key, value string) *Response {
 	res.Headers = append(res.Headers, Header{AsTitle(key), value})
 	return res
+}
+
+func (res *Response) WriteTo(w io.Writer) (n int64, err error) {
+	printf := func(format string, args ...any) error {
+		m, err := fmt.Fprintf(w, format, args...)
+		n += int64(m)
+		return err
+	}
+	if err := printf("HTTP/1.1 %d %s\r\n", res.StatusCode, http.StatusText(res.StatusCode)); err != nil {
+		return n, err
+	}
+	for _, h := range res.Headers {
+		if err := printf("%s: %s\r\n", h.Key, h.Value); err != nil {
+			return n, err
+		}
+
+	}
+	if err := printf("\r\n%s\r\n", res.Body); err != nil {
+		return n, err
+	}
+	return n, nil
 }
