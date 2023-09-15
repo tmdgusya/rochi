@@ -1,73 +1,142 @@
 package http
 
 import (
+	"bytes"
+	"encoding"
+	"fmt"
+	"log"
+	"net/http"
+	"strconv"
 	"strings"
 )
 
-// Header represents an HTTP header. An HTTP header is a key-value pair, separated by a colon(:);
-// The ky should be formatted in Title-Case.
-// Use Request.AddHeader() or Response.AddHeader() to add headers to a request or response
-// and guarantee title-casing of the key.
-type Header struct {
-	Key, Value string
+// Interface Section -- Start
+var _, _ fmt.Stringer = (*Request)(nil), (*Response)(nil) // compile-time check that Request and Response implement fmt.Stringer
+var _, _ encoding.TextMarshaler = (*Request)(nil), (*Response)(nil)
+
+func (r *Request) String() string     { b := new(strings.Builder); r.WriteTo(b); return b.String() }
+func (resp *Response) String() string { b := new(strings.Builder); resp.WriteTo(b); return b.String() }
+func (r *Request) MarshalText() ([]byte, error) {
+	b := new(bytes.Buffer)
+	r.WriteTo(b)
+	return b.Bytes(), nil
+}
+func (resp *Response) MarshalText() ([]byte, error) {
+	b := new(bytes.Buffer)
+	resp.WriteTo(b)
+	return b.Bytes(), nil
 }
 
-// AsTitle returns the given header key as title case; e.g. "content-type" -> "Content-Type"
-// You can implement this to use the standard library in Go
-// see https://pkg.go.dev/net/textproto#CanonicalMIMEHeaderKey
-func AsTitle(key string) string {
-	if key == "" {
-		panic("empty header key")
+// Interface Section -- End
+
+// ParseRequest parses a HTTP request from the given text.
+func ParseRequest(raw string) (r Request, err error) {
+	// request has three parts:
+	// 1. Request linedd
+	// 2. Headers
+	// 3. Body (optional)
+	lines := splitLines(raw)
+
+	log.Println(lines)
+	if len(lines) < 3 {
+		return Request{}, fmt.Errorf("malformed request: should have at least 3 lines")
 	}
-
-	if isTitleCase(key) {
-		return key
+	// First line is special.
+	first := strings.Fields(lines[0])
+	r.Method, r.Path = first[0], first[1]
+	if !strings.HasPrefix(r.Path, "/") {
+		return Request{}, fmt.Errorf("malformed request: path should start with /")
 	}
-
-	return newTitleCase(key)
-}
-
-func newTitleCase(key string) string {
-	var b strings.Builder
-	b.Grow(len(key))
-	for i := range key {
-
-		if i == 0 || key[i-1] == '-' {
-			b.WriteByte(upper(key[i]))
-			continue
+	if !strings.Contains(first[2], "HTTP") {
+		return Request{}, fmt.Errorf("malformed request: first line should contain HTTP version")
+	}
+	var foundhost bool
+	var bodyStart int
+	// then we have headers, up until the an empty line.
+	for i := 1; i < len(lines); i++ {
+		if lines[i] == "" { // empty line
+			bodyStart = i + 1
+			break
 		}
-		b.WriteByte(lower(key[i]))
-	}
-	return b.String()
-}
-
-func lower(c byte) byte {
-	if c >= 'A' && c <= 'Z' {
-		return c + 'a' - 'A'
-	}
-	return c
-}
-
-func upper(c byte) byte {
-	if c >= 'a' && c <= 'z' {
-		return c + 'A' - 'a'
-	}
-	return c
-}
-
-// isTitleCase returns true if the given header ky is already title case
-func isTitleCase(key string) bool {
-
-	for i := range key {
-		if i == 0 || key[i-1] == '-' {
-			// return false if the first character of the key is not upper-case
-			if key[i] >= 'a' && key[i] <= 'z' {
-				return false
-			}
-		} else if key[i] >= 'A' && key[i] <= 'Z' {
-			// return false if the remain characters except for the first one of the key is not lower-case
-			return false
+		key, val, ok := strings.Cut(lines[i], ": ")
+		if !ok {
+			return Request{}, fmt.Errorf("malformed request: header %q should be of form 'key: value'", lines[i])
 		}
+		if key == "Host" { // special case: host header is required.
+			foundhost = true
+		}
+		key = AsTitle(key)
+
+		r.Headers = append(r.Headers, Header{key, val})
 	}
-	return true
+	end := len(lines) - 1 // recombine the body using normal newlines; skip the last empty line.
+	r.Body = strings.Join(lines[bodyStart:end], "\r\n")
+	if !foundhost {
+		return Request{}, fmt.Errorf("malformed request: missing Host header")
+	}
+	return r, nil
+}
+
+// ParseResponse parses the given HTTP/1.1 response string into the Response. It returns an error if the Response is invalid,
+// - not a valid integer
+// - invalid status code
+// - missing status text
+// - invalid headers
+// it doesn't properly handle multi-line headers, headers with multiple values, or html-encoding, etc.zzs
+func ParseResponse(raw string) (resp *Response, err error) {
+	// response has three parts:
+	// 1. Response line
+	// 2. Headers
+	// 3. Body (optional)
+	lines := splitLines(raw)
+	log.Println(lines)
+
+	// First line is special.
+	first := strings.SplitN(lines[0], " ", 3)
+	if !strings.Contains(first[0], "HTTP") {
+		return nil, fmt.Errorf("malformed response: first line should contain HTTP version")
+	}
+	resp = new(Response)
+	resp.StatusCode, err = strconv.Atoi(first[1])
+	if err != nil {
+		return nil, fmt.Errorf("malformed response: expected status code to be an integer, got %q", first[1])
+	}
+	if first[2] == "" || http.StatusText(resp.StatusCode) != first[2] {
+		log.Printf("missing or incorrect status text for status code %d: expected %q, but got %q", resp.StatusCode, http.StatusText(resp.StatusCode), first[2])
+	}
+	var bodyStart int
+	// then we have headers, up until the an empty line.
+	for i := 1; i < len(lines); i++ {
+		log.Println(i, lines[i])
+		if lines[i] == "" { // empty line
+			bodyStart = i + 1
+			break
+		}
+		key, val, ok := strings.Cut(lines[i], ": ")
+		if !ok {
+			return nil, fmt.Errorf("malformed response: header %q should be of form 'key: value'", lines[i])
+		}
+		key = AsTitle(key)
+		resp.Headers = append(resp.Headers, Header{key, val})
+	}
+	resp.Body = strings.TrimSpace(strings.Join(lines[bodyStart:], "\r\n")) // recombine the body using normal newlines.
+	return resp, nil
+}
+
+// splitLines on the "\r\n" sequence; multiple separators in a row are NOT collapsed.
+func splitLines(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var lines []string
+	i := 0
+	for {
+		j := strings.Index(s[i:], "\r\n")
+		if j == -1 {
+			lines = append(lines, s[i:])
+			return lines
+		}
+		lines = append(lines, s[i:i+j]) // up to but not including the \r\n
+		i += j + 2                      // skip the \r\n
+	}
 }
