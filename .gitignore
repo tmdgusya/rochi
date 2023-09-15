@@ -1,3 +1,6 @@
 .idea
+
+## Executalbe File
+dns
 client/client
 server/server
